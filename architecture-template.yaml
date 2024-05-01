@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  ComprehendEndpointARN:
+    Type: String
+    Description: 'Comprehend trained endpoint ARN'
+ 
+Resources:
+  AnalyzeLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: analyze-lambda-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: LambdaPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:*
+                    - dynamodb:*
+                    - comprehend:*
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: "*"
+  
+  AnalyzeLambdaFunction:
+      Type: AWS::Lambda::Function
+      Properties:
+          Handler: index.lambda_handler
+          Role: !GetAtt AnalyzeLambdaRole.Arn
+          FunctionName: analyzeFunction
+          Code:
+              ZipFile: !Sub |
+                  import json
+                  import boto3
+                  import os
+
+                  def lambda_handler(event, context):
+                      
+                      comprehend = boto3.client('comprehend')
+                      dynamodb_resource = boto3.resource('dynamodb')
+                      table = dynamodb_resource.Table('report-classification')
+                      
+                      ReportID = json.loads(event['Records'][0]['body'])['reportID']
+                      text = json.loads(event['Records'][0]['body'])['text']
+                      
+                      print(ReportID, text)
+                              
+                      response = comprehend.classify_document(Text=text, 
+                      EndpointArn=os.environ.get("ComprehendEndpoint"))
+                      
+                      classification = response['Classes'][0]['Name']
+                      
+                      
+                      item = {
+                          'ReportID': ReportID,
+                          'text': text,
+                          'classification': classification,
+                          'process': 'Success'
+                          }
+                      table.put_item(Item=item)
+
+
+                      
+                      return 'Successfully processed'
+
+
+
+          Environment:
+            Variables:
+              ComprehendEndpoint: !Ref ComprehendEndpointARN
+          Runtime: python3.12
+          Timeout: 60
+          MemorySize: 256
+          TracingConfig: 
+            Mode: Active
+
+
+  DlqLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: dlq-lambda-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: LambdaPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:*
+                    - dynamodb:*
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: "*"
+  
+  DlqLambdaFunction:
+      Type: AWS::Lambda::Function
+      Properties:
+          Handler: index.lambda_handler
+          Role: !GetAtt DlqLambdaRole.Arn
+          FunctionName: dlqFunction
+          Code:
+              ZipFile: !Sub |
+                  import json
+                  import boto3
+                  import uuid
+
+
+                  def lambda_handler(event, context):
+                      
+                      dynamodb_resource = boto3.resource('dynamodb')
+                      
+                      try:
+                          table = dynamodb_resource.Table('report-classification')
+                          
+                          ReportID = json.loads(event['Records'][0]['body'])['reportID']
+                          text = json.loads(event['Records'][0]['body'])['text']
+                              
+                          item = {
+                              'ReportID': ReportID,
+                              'text': text,
+                              'process': 'Failed'
+                              }
+                          table.put_item(Item=item)
+                          return 'Added to table with failed processing'
+                      except Exception as e:
+                          print(e)
+                          table = dynamodb_resource.Table('lost-requests')
+                          item = {
+                              'exception': str(e),
+                              'event': str(event),
+                              'RequestID': str(uuid.uuid4())
+                          }
+                          table.put_item(Item=item)
+                          return 'Added to lost requests'
+                      
+                      return 'Failed'
+          Runtime: python3.12
+          Timeout: 60
+          MemorySize: 256
+          TracingConfig: 
+            Mode: Active
+  
+  DynamoDBTableReports: 
+      Type: AWS::DynamoDB::Table
+      Properties: 
+        AttributeDefinitions: 
+          - 
+            AttributeName: "ReportID"
+            AttributeType: "S"
+        KeySchema: 
+          - 
+            AttributeName: "ReportID"
+            KeyType: "HASH"
+        ProvisionedThroughput: 
+          ReadCapacityUnits: "1"
+          WriteCapacityUnits: "1"
+        TableName: "report-classification"
+  
+  DynamoDBTableLostRequests: 
+      Type: AWS::DynamoDB::Table
+      Properties: 
+        AttributeDefinitions: 
+          - 
+            AttributeName: "RequestID"
+            AttributeType: "S"
+        KeySchema: 
+          - 
+            AttributeName: "RequestID"
+            KeyType: "HASH"
+        ProvisionedThroughput: 
+          ReadCapacityUnits: "1"
+          WriteCapacityUnits: "1"
+        TableName: "lost-requests"
+  
+  ReportQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: ReportDlq
+    Properties:
+      QueueName: reports-queue
+      RedrivePolicy:
+        deadLetterTargetArn : !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:reports-dlq-1"
+        maxReceiveCount : 3
+      VisibilityTimeout: 60
+
+  ReportDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: reports-dlq-1
+      MessageRetentionPeriod: 300
+      RedriveAllowPolicy:
+        redrivePermission: allowAll
+      VisibilityTimeout: 60
+
+  
+  ReportsLambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt ReportQueue.Arn
+      FunctionName: !GetAtt AnalyzeLambdaFunction.Arn
+  
+  DLQLambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt ReportDlq.Arn
+      FunctionName: !GetAtt DlqLambdaFunction.Arn
+  
+  RestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: reports-api
+  
+  APIRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: api-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: apigateway.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: LambdaPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:*
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                    - logs:DescribeLogGroups
+                    - logs:DescribeLogStreams
+                    - logs:GetLogEvents
+                    - logs:FilterLogEvents
+                  Resource: "*"
+  
+  APIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt RestAPI.RootResourceId 
+      RestApiId: !Ref RestAPI
+      PathPart: reports
+  
+  APIPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      Integration: 
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: 200
+        Credentials: !GetAtt APIRole.Arn
+        RequestTemplates:
+          application/json: |
+            Action=SendMessage&MessageBody=$util.urlEncode($input.body)
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+        Type: AWS
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/reports-queue"
+      ResourceId: !Ref APIResource
+      RestApiId: !Ref RestAPI
+
+
+  
